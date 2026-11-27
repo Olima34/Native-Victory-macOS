@@ -35,8 +35,17 @@
 //! relies on that (not past a branch on an SCC from a `v_readfirstlane`,
 //! unless of an LDS word read alike in a barrier phase: `barrier_reads`).
 //! An SCC computed from a `v_readfirstlane` is not uniform here: each half
-//! reads its own first lane. Elsewhere (in a branch of EXEC, a
-//! per-lane loop) the translation is refused. Cost: two barriers and a
+//! reads its own first lane.
+//!
+//! In a group of several waves, a block one wave reaches by an SCC of its own (some lane of the
+//! wave has work: a whole-wave minimum follows) is not one every thread reaches: the other
+//! waves of the group are in the branch's other arm. The exchange's barriers are then relayed
+//! ([`Lower::xchg_barrier`]): the arm's code jumps to a block of its own for each group
+//! barrier, and the branch sends the threads of the other arm through the same blocks before
+//! their own arm, so every thread of the group runs each barrier once, at the same place. That
+//! needs the branch itself in a block every thread of the group reaches together, its SCC the
+//! same in both halves of a wave, and the block reached from nowhere else. Elsewhere (in a
+//! branch of EXEC, a per-lane loop) the translation is refused. Cost: two barriers and a
 //! shared-memory round trip per such operation, 4 bytes per thread of
 //! group-shared memory in all, and `WaveSize(32)` in place of 64.
 //!
@@ -45,25 +54,88 @@
 //! ([`split_wave_barriers`](super::split_wave_barriers)), or is refused.
 
 use super::{Lower, Why};
-use crate::emit::bitcode::{Attr, Bin, V, pred};
+use crate::emit::bitcode::{Attr, Bin, Term, V, pred};
 use crate::emit::shader::flags;
 use crate::emit::wave::Op;
 
 impl Lower<'_> {
     /// A group barrier with a shared-memory fence in DXIL block `at`.
-    fn xchg_barrier(&mut self, at: usize) {
+    fn group_sync(&mut self, at: usize) {
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
-    /// Whether every thread of the group (both halves of a console wave)
-    /// reaches IR block `ir` together.
+    /// A group barrier of an exchange after DXIL block `at`'s code; returns the DXIL block the
+    /// code goes on in: `at`, or a new one behind a relayed barrier (see the module).
+    fn xchg_barrier(&mut self, at: usize) -> usize {
+        let ir = self.cur_ir;
+        if self.once[ir] || self.x.st.lockstep || at != self.cur {
+            self.group_sync(at);
+            return at;
+        }
+        // `exchange_site` allowed this block as one arm of a relayed branch.
+        let q = self.x.p.blocks[ir].preds[0];
+        let br = self.branches[&q];
+        let mine = br.on.0 == ir;
+        let (sync, next) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(at, Term::Br(sync));
+        // The other arm's threads come here from the branch, or from the relay before this one.
+        let other = if mine { br.off } else { br.on };
+        let target = match self.relays.get(&ir).copied() {
+            Some(r) => {
+                let (t, f) = if mine { (r.next, sync) } else { (sync, r.next) };
+                self.s.m.terminate(r.last, Term::CondBr(br.cond, t, f));
+                r.target
+            }
+            None => {
+                let (t, f) = if mine { (br.on.1, sync) } else { (sync, br.off.1) };
+                self.s.m.terminate(br.tail, Term::CondBr(br.cond, t, f));
+                other.1
+            }
+        };
+        self.group_sync(sync);
+        let (t, f) = if mine { (next, target) } else { (target, next) };
+        self.s.m.terminate(sync, Term::CondBr(br.cond, t, f));
+        self.relays.insert(ir, super::Relay { last: sync, next, target });
+        // What the other arm's block joins from the branch now comes from the last relay, unless
+        // an edge block already stands between them.
+        if self.block[other.0] == Some(target) {
+            self.edges.insert((q, other.0), sync);
+        }
+        self.cur = next;
+        next
+    }
+
+    /// Whether both host waves of a console wave compute SCC condition `when` alike: SCC values
+    /// alone, none from a first-lane read each half makes of its own lane.
+    pub(super) fn wave_uniform(&self, when: crate::structure::Bool) -> bool {
+        use crate::structure::Atom;
+        self.x.st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(v) if !self.split.contains(v)))
+    }
+
+    /// Whether the exchange's barriers can go in IR block `ir`: every thread of the group (both
+    /// halves of a console wave) reaches it together, or it is one arm of a branch whose other
+    /// arm can be sent through them (see the module).
     fn exchange_site(&self, ir: usize) -> Result<(), Why> {
         // In lockstep every thread reaches every block together (`lockstep.rs`).
         if self.once[ir] || self.x.st.lockstep {
             return Ok(());
+        }
+        if ir == self.cur_ir
+            && let [q] = self.x.p.blocks[ir].preds[..]
+            && self.once[q]
+            && let Some(br) = self.branches.get(&q)
+            && br.uniform
+            // One arm's relays only: the other arm would need this arm's threads sent back.
+            && !self.relays.contains_key(&if br.on.0 == ir { br.off.0 } else { br.on.0 })
+        {
+            return Ok(());
+        }
+        if std::env::var_os("DBG_X").is_some() {
+            let b = &self.x.p.blocks[ir];
+            eprintln!("DBG refused ir {ir}@{:#x} cur_ir {} preds {:?} once_preds {:?} branches {:?} relays {:?}", b.offset, self.cur_ir, b.preds, b.preds.iter().map(|q| self.once[*q]).collect::<Vec<_>>(), b.preds.iter().map(|q| self.branches.get(q).map(|x| (x.on.0, x.off.0, x.uniform))).collect::<Vec<_>>(), self.relays.keys().collect::<Vec<_>>());
         }
         Err(super::DIVERGENT_EXCHANGE)
     }
@@ -115,13 +187,13 @@ impl Lower<'_> {
         let mine = self.s.m.bin(at, Bin::LShr, f, five);
         let slot = self.xchg_slot(at, mine);
         self.s.m.store(at, slot, x);
-        self.xchg_barrier(at);
+        let at = self.xchg_barrier(at);
         let pair = self.s.m.bin(at, Bin::LShr, f, six);
         let lo_at = self.s.m.bin(at, Bin::Shl, pair, one);
         let hi_at = self.s.m.bin(at, Bin::Add, lo_at, one);
         let (lo_p, hi_p) = (self.xchg_slot(at, lo_at), self.xchg_slot(at, hi_at));
         let (lo, hi) = (self.s.m.load(at, lo_p), self.s.m.load(at, hi_p));
-        self.xchg_barrier(at);
+        let at = self.xchg_barrier(at);
         // A missing upper half has no lanes on.
         let hi = match self.xchg_written(at, hi_at, 5) {
             Some(there) => {
@@ -153,14 +225,14 @@ impl Lower<'_> {
         let f = self.console_flat();
         let slot = self.xchg_slot(c, f);
         self.s.m.store(c, slot, x);
-        self.xchg_barrier(c);
+        let c = self.xchg_barrier(c);
         let (k63, not63) = (self.s.m.i32(63), self.s.m.i32(!63));
         let wave = self.s.m.bin(c, Bin::And, f, not63);
         let lane = self.s.m.bin(c, Bin::And, lane, k63);
         let src = self.s.m.bin(c, Bin::Or, wave, lane);
         let p = self.xchg_slot(c, src);
         let r = self.s.m.load(c, p);
-        self.xchg_barrier(c);
+        let c = self.xchg_barrier(c);
         // Guess: a lane the group lacks reads as 0 (the console reads whatever its VGPR holds).
         Ok(match self.xchg_written(c, src, 0) {
             Some(there) => self.s.m.select(c, there, r, z),
@@ -209,13 +281,13 @@ impl Lower<'_> {
         let half = self.s.m.bin(c, Bin::LShr, f, five);
         let slot = self.xchg_slot(c, half);
         self.s.m.store(c, slot, bits);
-        self.xchg_barrier(c);
+        let c = self.xchg_barrier(c);
         let pair = self.s.m.bin(c, Bin::LShr, f, six);
         let lo_at = self.s.m.bin(c, Bin::Shl, pair, one);
         let hi_at = self.s.m.bin(c, Bin::Add, lo_at, one);
         let (lo_p, hi_p) = (self.xchg_slot(c, lo_at), self.xchg_slot(c, hi_at));
         let (lo, hi) = (self.s.m.load(c, lo_p), self.s.m.load(c, hi_p));
-        self.xchg_barrier(c);
+        let c = self.xchg_barrier(c);
         let (lo, hi) = if float {
             (self.as_float(lo), self.as_float(hi))
         } else {

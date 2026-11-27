@@ -361,6 +361,15 @@ struct Lower<'a> {
     /// With `halves`, blocks where both halves of a console wave arrive
     /// together: [`once_blocks`], or [`wave_blocks`] in a group of one wave.
     once: Vec<bool>,
+    /// With `halves`, each forward branch as it was lowered, by IR block: the DXIL block that
+    /// ends with it, its condition, and where it goes when the condition holds and when it does
+    /// not (IR block and DXIL target). For the relays of `lower/halves.rs`.
+    branches: Map<usize, Branched>,
+    /// With `halves`, the relays made so far, by the IR block whose exchanges they carry.
+    relays: Map<usize, Relay>,
+    /// With `halves`, the SCC values the two host waves of a console wave can compute apart
+    /// ([`split_scc`]).
+    split: Set<Value>,
     /// Why the program cannot run on a 32-lane host.
     refuse: Option<Why>,
     /// The group's lane in console order, made in the entry block.
@@ -916,6 +925,7 @@ impl<'a> Lower<'a> {
             || (x.zero_copy_memory && x.native.stage != HwStage::Cs);
         let mut console_lanes = console;
         let (mut host32, mut halves, mut once, mut refuse) = (false, false, Vec::new(), None);
+        let mut split = Set::default();
         let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -998,7 +1008,8 @@ impl<'a> Lower<'a> {
                     s.wave_size = Some(32);
                 }
                 if halves {
-                    once = if one_wave { wave_blocks(p, x.st) } else { once_blocks(p) };
+                    once = if one_wave { wave_blocks(p, x.st) } else { group_blocks(p, x.st, x.io) };
+                    split = split_scc(p, &barrier_reads(p, x.st));
                     for (o, at_barrier) in once.iter_mut().zip(barrier_blocks(p, x.st)) {
                         *o |= at_barrier;
                     }
@@ -1107,6 +1118,9 @@ impl<'a> Lower<'a> {
             host32,
             halves,
             once,
+            branches: Map::default(),
+            relays: Map::default(),
+            split,
             console_flat: None,
             refuse,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -13750,6 +13764,11 @@ impl<'a> Lower<'a> {
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                if self.halves && !back(self, taken) && !back(self, not_taken) {
+                    let (tail, uniform) = (self.cur, self.wave_uniform(when));
+                    if std::env::var_os("DBG_X").is_some() { eprintln!("DBG branch of ir {b}@{offset:#x}: support {:?} split {:?}", self.x.st.bools.support(when), self.x.st.bools.support(when).iter().map(|a| matches!(a, Atom::Uniform(v) if self.split.contains(v))).collect::<Vec<_>>()); }
+                    self.branches.insert(b, Branched { tail, cond, on: (taken, t), off: (not_taken, f), uniform });
+                }
                 for (to, via) in [(taken, t), (not_taken, f)] {
                     if !back(self, to) {
                         // From an edge block, or from here.
@@ -14692,6 +14711,28 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// A forward branch as [`Lower::exit`] lowered it.
+#[derive(Clone, Copy)]
+pub(super) struct Branched {
+    /// The DXIL block that ends with the branch.
+    pub tail: usize,
+    pub cond: V,
+    /// The IR block and DXIL target taken when `cond` holds, and when it does not.
+    pub on: (usize, usize),
+    pub off: (usize, usize),
+    /// Whether both host waves of a console wave take it the same way ([`Lower::wave_uniform`]).
+    pub uniform: bool,
+}
+
+/// The relays of one arm of a branch (`lower/halves.rs`): the DXIL block of the last one, where
+/// it sends the arm's own threads (`next`) and the other arm's (`target`).
+#[derive(Clone, Copy)]
+pub(super) struct Relay {
+    pub last: usize,
+    pub next: usize,
+    pub target: usize,
+}
+
 /// The refusal of LDS a split console wave shares in divergent code.
 pub(crate) const SPLIT_LDS: &str = "LDS shared in a wave the host splits, in divergent code";
 /// The refusal of a cross-lane operation between host waves in divergent code.
@@ -14954,6 +14995,67 @@ pub(crate) fn wave_blocks(p: &Program, st: &Structured) -> Vec<bool> {
                 .support(st.reach[b])
                 .iter()
                 .all(|a| matches!(a, Atom::Uniform(v) if !split.contains(v)));
+    }
+    once
+}
+
+/// Scalar values that can differ between the threads of one compute group: what a vector
+/// instruction writes to an SGPR or SCC (a compare's mask, a lane read, each wave's own), the
+/// thread-group info SGPR (it numbers the wave), EXEC and VCC on entry, and scalar work on any
+/// of those. The rest is the same in every thread: user SGPRs, the group's ids, constants, and
+/// scalar loads at such addresses.
+/// Guess: memory a scalar load reads (descriptors, constant buffers) does not change while the
+/// group runs; the title's compiler loads only such memory with scalar instructions.
+fn apart_in_group(p: &Program, io: &crate::io::Io) -> Set<Value> {
+    let mut from: Set<Value> = Set::default();
+    from.extend(p.inputs.iter().filter(|(r, _)| matches!(r, Reg::V(_) | Reg::S(crate::ir::EXEC..) | Reg::S(crate::ir::VCC..=107))).map(|i| i.1));
+    from.extend(io.inputs.iter().filter(|i| matches!(i.1, Input::GroupInfo | Input::MergedWaveInfo)).map(|i| i.0));
+    loop {
+        let n = from.len();
+        for b in &p.blocks {
+            for phi in &b.phis {
+                if phi.args.iter().any(|a| from.contains(a)) {
+                    from.insert(phi.value);
+                }
+            }
+            for i in &b.insts {
+                let scalar = matches!(i.fields, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. });
+                if !scalar || i.reads.iter().any(|r| from.contains(&r.1)) {
+                    from.extend(i.writes.iter().filter(|w| !matches!(w.0, Reg::V(_))).map(|w| w.1));
+                }
+            }
+        }
+        if from.len() == n {
+            return from;
+        }
+    }
+}
+
+/// Blocks every thread of a group of several console waves runs together, at most once: those
+/// of [`once_blocks`], and those outside any cycle reached by branches on SCCs that are the same
+/// in every thread of the group ([`apart_in_group`]: a flag of a constant buffer, not a wave's
+/// own mask), which the whole group takes or skips at once. [`wave_blocks`] for a group of
+/// several waves, where a wave's SCC is not the others'.
+pub(crate) fn group_blocks(p: &Program, st: &Structured, io: &crate::io::Io) -> Vec<bool> {
+    let n = p.blocks.len();
+    let apart = apart_in_group(p, io);
+    let mut once = once_blocks(p);
+    for (b, once) in once.iter_mut().enumerate() {
+        let mut seen = vec![false; n];
+        let mut stack = p.blocks[b].exit.successors();
+        let mut cycle = false;
+        while let Some(x) = stack.pop() {
+            cycle |= x == b;
+            if !std::mem::replace(&mut seen[x], true) {
+                stack.extend(p.blocks[x].exit.successors());
+            }
+        }
+        *once |= !cycle
+            && st
+                .bools
+                .support(st.reach[b])
+                .iter()
+                .all(|a| matches!(a, Atom::Uniform(v) if !apart.contains(v)));
     }
     once
 }
