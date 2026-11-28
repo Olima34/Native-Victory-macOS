@@ -133,6 +133,46 @@ impl Lower<'_> {
         Ok((lo, hi))
     }
 
+    /// `x` of the console wave's first lane that is `on`, in a wave64 mesh program (whose threads
+    /// are console lanes, `lane_index_at`), at a block every thread runs once: each host wave
+    /// finds its own first lane on and that lane's `x`; its lane 0 stores the value and its lane 1
+    /// whether any lane was on, in their own slots; after a group barrier every thread takes the
+    /// lower half's value if any of its lanes was on, else the upper half's. A wave with no lane on
+    /// gives the upper half's (undefined on the console).
+    pub(super) fn mesh_first_lane(&mut self, x: V, on: V) -> V {
+        let at = self.cur;
+        let f = self.mesh_thread();
+        let (lo, _) = self.host_ballot(at, on);
+        let i32t = self.s.t.i32;
+        // First set bit (-1 for none); the host wave's own lanes, 32 of them.
+        let first = self.s.op(at, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        let k31 = self.s.m.i32(31);
+        let src = self.s.m.bin(at, Bin::And, first, k31);
+        let value = self.read_lane(x, src);
+        let z = self.s.m.i32(0);
+        let any = self.s.m.cmp(at, pred::NE, lo, z);
+        let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
+        let any = self.s.m.select(at, any, one, zero);
+        // Host lane 0 stores the value, lane 1 the flag: each in its own slot.
+        let host_lane = self.s.m.bin(at, Bin::And, f, k31);
+        let is_flag = self.s.m.cmp(at, pred::EQ, host_lane, one);
+        let mine = self.s.m.select(at, is_flag, any, value);
+        let slot = self.xchg_slot(at, f);
+        self.s.m.store(at, slot, mine);
+        self.xchg_barrier(at);
+        let k = self.s.m.i32(!63);
+        let base = self.s.m.bin(at, Bin::And, f, k);
+        let k32 = self.s.m.i32(32);
+        let upper = self.s.m.bin(at, Bin::Add, base, k32);
+        let base1 = self.s.m.bin(at, Bin::Add, base, one);
+        let (lv, lf, uv) = (self.xchg_slot(at, base), self.xchg_slot(at, base1), self.xchg_slot(at, upper));
+        let (lv, lf, uv) = (self.s.m.load(at, lv), self.s.m.load(at, lf), self.s.m.load(at, uv));
+        self.xchg_barrier(at);
+        self.s.flags |= flags::WAVE_OPS;
+        let lower_on = self.s.m.cmp(at, pred::NE, lf, z);
+        self.s.m.select(at, lower_on, lv, uv)
+    }
+
     /// `x` of console lane `lane` (the low six bits count).
     pub(super) fn wide_read_lane(&mut self, x: V, lane: V) -> Result<V, Why> {
         if !self.host32 {

@@ -280,6 +280,73 @@ fn a_buffer_view_across_title_pages_out_of_pool_order_reads_the_title_mapping() 
     drop(slots);
 }
 
+/// A heap entry of a view one pool run holds points into the pool's buffer at the pages the
+/// title had there when it was written. The title maps other pool pages at the same addresses
+/// (it frees memory and takes it again) and writes the same record for its view: the entry kept
+/// the old pages, which belong to something else by then, so shaders read that and wrote into
+/// it (a world run, 2026-11-27: 2,048 such views moved in 300 s). It is followed as a wrap is.
+#[test]
+fn a_view_one_pool_run_holds_follows_title_pages_remapped_under_it() {
+    let Some(h) = host() else { return };
+    let page = page_size().max(16384);
+    let pool = Alias::new(5 * page).unwrap();
+    let info = PoolInfo { id: 1, base: pool.primary as usize, len: pool.len, memory_entry: None };
+    h.memory().pool_created(&info);
+    // Title page 0, pool page 2, holds the source; title page 1, pool page 3, takes the output.
+    let title = TitlePages::new(&h, &pool, &info, &[2 * page, 3 * page], page);
+    let (src, dst) = (0, page);
+    title.write(src, &(0..64u32).collect::<Vec<_>>());
+    // Pool page 4 holds other words.
+    // SAFETY: inside the pool's own mapping; the GPU is idle.
+    unsafe { std::ptr::copy_nonoverlapping((100..164u32).collect::<Vec<_>>().as_ptr(), pool.primary.add(4 * page).cast(), 64) };
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let placed = |at: usize| {
+        let mut d = [0u32; 16];
+        d[1] = 1; // buffer view
+        d[6] = 64; // elements
+        d[8] = 1; // raw (SRV flags word)
+        d[10] = (title.va + at as u64) as u32;
+        d[11] = ((title.va + at as u64) >> 32) as u32;
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1; // buffer
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start);
+    let mut uav = placed(dst);
+    (uav[4], uav[6]) = (64, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 32);
+    assert!(h.mirror(start).unwrap());
+    assert!(h.mirror(start + 32).unwrap());
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    // dst[i] = src[i] * 3 + 1 through the heap's views; dst starts at a canary.
+    let pass = || {
+        title.write(dst, &[0xCAFE_CAFEu32; 64]);
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_constants(0, &[3, 1]);
+        l.set_compute_root_table(1, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        run(&h, &[&l]);
+        title.read::<u32>(dst, 64)
+    };
+    assert_eq!(pass(), (0..64u32).map(|i| i * 3 + 1).collect::<Vec<_>>());
+    // The source's title page is pool page 4 now: the view reads it.
+    title.remap(&h, &info, &pool, 0, 4 * page, page);
+    assert_eq!(pass(), (0..64u32).map(|i| (i + 100) * 3 + 1).collect::<Vec<_>>(), "the view still read the old pool page");
+    // The output's title page is pool page 0 now: the store lands there, not in pool page 3.
+    // SAFETY: inside the pool's own mapping; the GPU is idle.
+    unsafe { std::ptr::write_bytes(pool.primary.add(3 * page), 0, 256) };
+    title.remap(&h, &info, &pool, 1, 0, page);
+    assert_eq!(pass(), (0..64u32).map(|i| (i + 100) * 3 + 1).collect::<Vec<_>>(), "the store went to the old pool page");
+    // SAFETY: as above; read after the fence wait.
+    let old = unsafe { std::slice::from_raw_parts(pool.primary.add(3 * page).cast::<u32>(), 64) };
+    assert_eq!(old, [0u32; 64], "the old pool page, someone else's by now, was written");
+    drop(slots);
+}
+
 /// A wrap keeps the physical pages it was made over: once the title maps other pool pages at
 /// those title addresses, or unmaps them, the GPU still reads the old pages through it (no fault,
 /// no zeros; seen on an M5 Pro, macOS 27). The host mirrors such a heap entry again before the
@@ -384,12 +451,13 @@ fn copies_of_a_wrapped_view_are_followed_with_one_walk() {
     crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 96);
     assert!(h.mirror(start + 96).unwrap());
     let walks = || super::host::SIGNATURES.with(|n| n.replace(0));
-    // A pool-table change elsewhere: one walk for the three copies, none moved.
+    // A pool-table change elsewhere: one walk for the three copies and one for the output's view
+    // (one pool run holds it, and it is followed too), none moved.
     h.memory().pool_created(&PoolInfo { id: 2, base: 0x1000, len: 0x1000, memory_entry: None });
     walks();
     run(&h, &[]);
-    assert_eq!(walks(), 1);
-    // Remapped under them: still one walk, and the copy the program reads follows.
+    assert_eq!(walks(), 2);
+    // Remapped under them: still one walk a range, and the copy the program reads follows.
     let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
     title.remap(&h, &info, &pool, 1, 4 * page, page);
     title.write(dst, &[0xCAFE_CAFEu32; 64]);
@@ -401,7 +469,7 @@ fn copies_of_a_wrapped_view_are_followed_with_one_walk() {
     l.dispatch(1, 1, 1).unwrap();
     walks();
     run(&h, &[&l]);
-    assert_eq!(walks(), 1);
+    assert_eq!(walks(), 2);
     let expect: Vec<u32> = (0..64u32).map(|i| if i < 32 { i * 3 + 1 } else { (i + 68) * 3 + 1 }).collect();
     assert_eq!(title.read::<u32>(dst, 64), expect);
     drop(slots);

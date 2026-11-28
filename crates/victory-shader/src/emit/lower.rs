@@ -1056,6 +1056,15 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            // A wave64 mesh program's `v_readfirstlane_b32` reads its console wave's first lane,
+            // which is in the other 32-lane host wave when the first one has no lane on (and
+            // the value can differ between the halves: meshlets packed several to a group give
+            // each lane its own meshlet's counts). Where every thread runs the block once, the
+            // two halves exchange their first lanes through group-shared memory (`halves.rs`).
+            if x.native.wave64 && insts().any(|i| i.name() == "v_readfirstlane_b32") {
+                once = once_blocks(p);
+                s.xchg_dwords = ms.threads.next_multiple_of(64);
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -9703,6 +9712,16 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
                 let a = s(self, 0)?;
                 int(self, a)
+            }
+            "v_readfirstlane_b32"
+                if self.s.mesh.is_some()
+                    && self.s.xchg_dwords > 0
+                    && self.once.get(self.cur_ir).copied().unwrap_or(false) =>
+            {
+                let a = s(self, 0)?;
+                let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+                let r = self.mesh_first_lane(a, on);
+                int(self, r)
             }
             "v_readfirstlane_b32" if self.x.st.lockstep => {
                 // Lockstep: every thread runs, so the first lane is the wide EXEC's.

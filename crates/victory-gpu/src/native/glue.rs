@@ -1288,6 +1288,24 @@ fn pass_note_op(l: &mut MetalList, what: &str, src: Option<usize>, dst: Option<u
     l.list.notes.push((at, format!("kind={what} src={:?} dst={:?}", src.map(pass_tex), dst.map(pass_tex))));
 }
 
+/// The description of a texture the pass trace named: the title's object at `key`, else the
+/// host's own record (`host`). A placed texture's key is no object's address
+/// (`textures::placed_key` sets its top bit), so only the host's record describes it: reading it
+/// as an object crashed the game at the window's last present.
+fn pass_info(key: usize, host: impl Fn(usize) -> Option<super::textures::TextureInfo>) -> Option<super::textures::TextureInfo> {
+    if key >> (usize::BITS - 1) != 0 {
+        return host(key);
+    }
+    crate::resource::texture_info(key as This).or_else(|| host(key))
+}
+
+#[cfg(test)]
+#[test]
+fn the_pass_trace_reads_no_object_at_a_placed_textures_key() {
+    let key = super::textures::placed_key(0x1000, &[0; 14]);
+    assert!(pass_info(key, |_| None).is_none());
+}
+
 /// At each present: switch the window on and off, and while on write every texture the window's
 /// work named: its range, how much is non-zero and not finite, and (colour formats) an image.
 fn pass_present(resource: This) {
@@ -1335,7 +1353,7 @@ fn pass_present(resource: This) {
     if !keys.contains(&(resource as usize)) { keys.push(resource as usize); }
     with_title(|t| {
         for key in keys {
-            let Some(info) = crate::resource::texture_info(key as This).or_else(|| t.info_of(key).cloned()) else { continue };
+            let Some(info) = pass_info(key, |k| t.info_of(k).cloned()) else { continue };
             let (w, h) = (info.width as usize, info.height as usize);
             let bpp = match info.format { 2 => 16, 10 | 11 | 16 => 8, 24 | 26 | 28 | 29 | 34 | 41 | 42 | 67 | 87 | 91 => 4, 49 | 54 | 56 | 57 => 2, 61 | 62 | 65 => 1, _ => 0 };
             // A 3D texture (a colour grading table) is read whole; arrays are skipped.

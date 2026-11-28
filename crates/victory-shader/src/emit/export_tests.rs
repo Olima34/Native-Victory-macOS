@@ -32,9 +32,20 @@ fn lowered(
     outputs: Vec<SigElement>,
     prims: Vec<SigElement>,
 ) -> Result<Lowered, ShaderError> {
+    lowered_waves(stage, stage_io, words, outputs, prims, false)
+}
+
+fn lowered_waves(
+    stage: HwStage,
+    stage_io: StageIo,
+    words: &[u32],
+    outputs: Vec<SigElement>,
+    prims: Vec<SigElement>,
+    wave64: bool,
+) -> Result<Lowered, ShaderError> {
     let native = NativeProgram {
         stage,
-        wave64: false,
+        wave64,
         vgprs: 16,
         layout: vec![],
         used: vec![],
@@ -306,4 +317,51 @@ fn a_mesh_export_makes_every_value_before_its_first_store() {
             .iter()
             .all(|s| s.args.len() == 5 && s.args[4] == l.output_stores[0].args[4])
     );
+}
+
+/// A wave64 mesh program of 64 threads whose vertex takes a `v_readfirstlane_b32` of the lane
+/// index as its first parameter. Its threads are console lanes, and a 32-lane host wave is half
+/// of the console wave: each half reading its own first lane would give lanes 32 to 63 the value
+/// of lane 32, not of lane 0. The read goes through the group-shared exchange (between group
+/// barriers) instead; a wave32 program, one host wave per console wave, keeps the host's read.
+#[test]
+fn a_wave64_mesh_programs_first_lane_read_is_its_console_waves() {
+    let words = [
+        0xD765_0001u32,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0x7E28_0501, // v_readfirstlane_b32 s20, v1
+        0x7E0C_0214, // v_mov_b32 v6, s20
+        0x7E0E_02F2, // v_mov_b32 v7, 1.0
+        0xF800_020F,
+        0x0707_0706, // exp param0 v6, v7, v7, v7
+        0x7E12_02FF,
+        0x0020_0400, // v_mov_b32 v9, 0x200400 (corners 0, 1, 2)
+        0xF800_0941,
+        0x0000_0009, // exp prim v9, off, off, off done
+        0xF800_08CF,
+        0x0707_0707, // exp pos0 v7, v7, v7, v7 done
+        0xBF81_0000, // s_endpgm
+    ];
+    let io = |threads| {
+        StageIo::Ms(MeshIo {
+            outputs: vec![VsOutput {
+                usage: Usage::Generic,
+                row: 1,
+                param: 0,
+                fp16: false,
+                pack2: false,
+            }],
+            clip_cntl: 0,
+            threads,
+            max_vertices: threads,
+            max_primitives: threads,
+            topology: 2,
+            lds_bytes: 0,
+        })
+    };
+    let outputs = || vec![element("SV_Position", 0, 3, 0, 4, false), element("TEXCOORD", 0, 0, 1, 4, false)];
+    let wide = lowered_waves(HwStage::Ms, io(64), &words, outputs(), vec![], true).unwrap();
+    assert!(wide.exchanges, "the console wave's first lane, through the exchange");
+    let narrow = lowered_waves(HwStage::Ms, io(32), &words, outputs(), vec![], false).unwrap();
+    assert!(!narrow.exchanges, "one host wave per console wave reads its own");
 }
